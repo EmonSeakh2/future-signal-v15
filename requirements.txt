@@ -1,2 +1,7 @@
 flask
 requests
+pandas
+numpy
+yfinance
+ta
+Pillow
