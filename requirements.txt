@@ -1,7 +1,5 @@
-flask
-requests
-pandas
-numpy
 yfinance
-ta
-Pillow
+pandas
+requests
+pytz
+numpy
