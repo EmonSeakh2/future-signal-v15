@@ -1,201 +1,298 @@
-import os
-import time
-import threading
-import requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from flask import Flask
+import time
+import requests
 from datetime import datetime
-import ta
+import pytz
 
-app = Flask(__name__)
+# --- CONFIG ---
+BOT_TOKEN = "YOUR_BOT_TOKEN"  # তোমার Bot Token
+CHAT_ID = "YOUR_CHAT_ID"      # তোমার Chat ID
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-
-# REAL MARKET PAIRS - Yahoo Symbol ঠিক করা হইছে 99% Match এর জন্য
-REAL_PAIRS = {
-    "EUR/USD": "EURUSD=X",
-    "GBP/USD": "GBPUSD=X",
+PAIRS = {
     "USD/JPY": "USDJPY=X",
-    "AUD/USD": "AUDUSD=X",
-    "USD/CAD": "USDCAD=X",
-    "EUR/JPY": "EURJPY=X",
-    "GBP/JPY": "GBPJPY=X",
-    "EUR/GBP": "EURGBP=X"
+    "EUR/USD": "EURUSD=X",
+    "EUR/JPY": "EURJPY=X"
 }
 
+BD_TZ = pytz.timezone('Asia/Dhaka')
+EXPIRY_MIN = 5
+
 def send_telegram(msg):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        return
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
-        requests.post(url, data=data, timeout=10)
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=10)
     except Exception as e:
         print(f"Telegram Error: {e}")
 
-# ===== NEW: WIN/LOSS CHECK FUNCTION =====
-def check_and_send_result(pair_name, yf_symbol, entry_price, direction, entry_time_str):
-    """2 Min পর Result Check করবে"""
-    time.sleep(125)  # 2 Min 5 Sec Wait - Candle Close হওয়ার জন্য
+def get_bd_time():
+    return datetime.now(BD_TZ)
+
+# --- INDICATORS ---
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def macd(df):
+    ema12 = ema(df['Close'], 12)
+    ema26 = ema(df['Close'], 26)
+    macd_line = ema12 - ema26
+    signal = ema(macd_line, 9)
+    hist = macd_line - signal
+    return macd_line, signal, hist
+
+def adx(df, period=14):
+    high = df['High']; low = df['Low']; close = df['Close']
+    plus_dm = high.diff(); minus_dm = low.diff() * -1
+    tr = pd.concat([high - low, abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1/period).mean() / atr)
+    minus_di = 100 * (minus_dm.ewm(alpha=1/period).mean() / atr)
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+    return dx.ewm(alpha=1/period).mean(), plus_di, minus_di, atr
+
+def bollinger_width(close, period=20):
+    sma = close.rolling(period).mean()
+    std = close.rolling(period).std()
+    upper = sma + (2*std)
+    lower = sma - (2*std)
+    return (upper - lower) / sma
+
+# --- PRICE ACTION HIGH QUALITY ---
+def detect_candle_pattern(df):
+    last = df.iloc[-1]; prev = df.iloc[-2]
+    body_last = abs(last['Close'] - last['Open'])
+    body_prev = abs(prev['Close'] - prev['Open'])
+    
+    # Bullish Engulfing
+    if prev['Close'] < prev['Open'] and last['Close'] > last['Open'] and last['Close'] > prev['Open'] and last['Open'] < prev['Close']:
+        return "Bullish Engulfing", True
+    # Bearish Engulfing
+    if prev['Close'] > prev['Open'] and last['Close'] < last['Open'] and last['Close'] < prev['Open'] and last['Open'] > prev['Close']:
+        return "Bearish Engulfing", True
+    # Hammer / Pin Bar
+    lower_wick = min(last['Open'], last['Close']) - last['Low']
+    upper_wick = last['High'] - max(last['Open'], last['Close'])
+    if lower_wick > (body_last * 2) and upper_wick < body_last * 0.5:
+        return "Hammer Pin Bar", True
+    if upper_wick > (body_last * 2) and lower_wick < body_last * 0.5:
+        return "Shooting Star Pin Bar", True
+    return "No Pattern", False
+
+def detect_bos_choch(df):
+    # BOS = Higher High Higher Low, CHOCH = Break
+    highs = df['High'].tail(10); lows = df['Low'].tail(10)
+    hh = highs.iloc[-1] > highs.max() - highs.std()
+    hl = lows.iloc[-1] > lows.min() + lows.std()
+    ll = lows.iloc[-1] < lows.min() + lows.std()*0.5
+    if hh and hl:
+        return "BOS Uptrend", True
+    if ll:
+        return "CHOCH Downtrend", True
+    return "BOS/CHOCH", False
+
+def detect_liquidity_sweep(df):
+    # Sweep previous High then close below
+    prev_high = df['High'].iloc[-5:-1].max()
+    curr_high = df['High'].iloc[-1]
+    curr_close = df['Close'].iloc[-1]
+    prev_low = df['Low'].iloc[-5:-1].min()
+    curr_low = df['Low'].iloc[-1]
+    if curr_high > prev_high and curr_close < prev_high:
+        return "Liquidity Sweep High + Rejection", True
+    if curr_low < prev_low and curr_close > prev_low:
+        return "Liquidity Sweep Low + Rejection", True
+    return "No Sweep", False
+
+def detect_order_block_fvg(df):
+    # FVG: Candle1 High < Candle3 Low (Bullish FVG)
+    c1 = df.iloc[-3]; c2 = df.iloc[-2]; c3 = df.iloc[-1]
+    bullish_fvg = c3['Low'] > c1['High']
+    bearish_fvg = c3['High'] < c1['Low']
+    # Order Block: Last opposite candle before impulse
+    if bullish_fvg:
+        return f"Bullish FVG + Order Block {c1['Low']:.5f}", True
+    if bearish_fvg:
+        return f"Bearish FVG + Order Block {c1['High']:.5f}", True
+    return "No OB/FVG", False
+
+def detect_demand_supply(df):
+    recent_low = df['Low'].tail(20).min()
+    recent_high = df['High'].tail(20).max()
+    curr_price = df['Close'].iloc[-1]
+    if abs(curr_price - recent_low) / curr_price < 0.002: # Near Demand
+        return f"Demand Zone {recent_low:.5f}", True
+    if abs(curr_price - recent_high) / curr_price < 0.002: # Near Supply
+        return f"Supply Zone {recent_high:.5f}", True
+    return "Mid Zone", False
+
+def detect_key_level(price, df_daily):
+    round_level = round(price, 1) if "JPY" in str(price) else round(price, 2)
+    prev_high = df_daily['High'].iloc[-2] if len(df_daily)>=2 else price
+    prev_low = df_daily['Low'].iloc[-2] if len(df_daily)>=2 else price
+    if abs(price - prev_high)/price < 0.0015 or abs(price - prev_low)/price < 0.0015 or abs(price - round_level)/price < 0.001:
+        return f"Key Level {round_level}", True
+    return "No Key Level", False
+
+def get_data(symbol, interval):
     try:
-        data = yf.download(yf_symbol, period="1d", interval="1m", progress=False)
-        if len(data) < 2:
-            return
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-        
-        exit_price = float(data['Close'].iloc[-1])
-        
-        is_win = False
-        if "CALL" in direction and exit_price > entry_price:
-            is_win = True
-        elif "PUT" in direction and exit_price < entry_price:
-            is_win = True
-        
-        if is_win:
-            result_msg = f"""✅ **WIN ✅ WIN ✅**
+        df = yf.download(symbol, period="5d", interval=interval, progress=False)
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        df.dropna(inplace=True)
+        return df
+    except: return None
 
-💱 {pair_name} - {direction}
-Entry: `{entry_price:.5f}`
-Exit: `{exit_price:.5f}`
-Time: {entry_time_str}
+# --- MAIN ANALYSIS ---
+def analyze_pair(pair_name, symbol):
+    df_30m = get_data(symbol, "30m")
+    df_15m = get_data(symbol, "15m")
+    df_5m = get_data(symbol, "5m")
+    df_1d = get_data(symbol, "1d")
 
-🔥 Profit: +57% 🔥"""
-        else:
-            result_msg = f"""❌ **LOSS ❌ LOSS**
+    if df_30m is None or df_15m is None or df_5m is None or len(df_30m)<60 or len(df_5m)<60:
+        return None
 
-💱 {pair_name} - {direction}
-Entry: `{entry_price:.5f}`
-Exit: `{exit_price:.5f}`
-Time: {entry_time_str}
-
-⚠️ Next Signal Wait করো"""
-        
-        send_telegram(result_msg)
-        print(f"Result Sent: {pair_name} - {'WIN' if is_win else 'LOSS'}")
-        
-    except Exception as e:
-        print(f"Result Check Error {pair_name}: {e}")
-
-def check_market_condition(df):
-    adx = ta.trend.adx(df['High'], df['Low'], df['Close'], window=14)
-    if adx.iloc[-1] < 22:
-        return False, "Weak Trend"
-    atr = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
-    if atr.iloc[-1] < 0.0003:
-        return False, "Low Volatility"
-    bb_width = ta.volatility.bollinger_wband(df['Close'])
-    if bb_width.iloc[-1] < 0.005:
-        return False, "Squeeze"
-    return True, "Good"
-
-def high_accuracy_strategy(df):
-    close = df['Close']
-    ema9 = ta.trend.ema_indicator(close, window=9).iloc[-1]
-    ema21 = ta.trend.ema_indicator(close, window=21).iloc[-1]
-    ema50 = ta.trend.ema_indicator(close, window=50).iloc[-1]
-    rsi = ta.momentum.rsi(close, window=14).iloc[-1]
-    macd_line = ta.trend.macd(close).iloc[-1]
-    macd_signal = ta.trend.macd_signal(close).iloc[-1]
-    bb_high = ta.volatility.bollinger_hband(close).iloc[-1]
-    bb_low = ta.volatility.bollinger_lband(close).iloc[-1]
-    last_close = close.iloc[-1]
-    last_low = df['Low'].iloc[-1]
-    last_high = df['High'].iloc[-1]
+    # Indicators 5m
+    df_5m['EMA9'] = ema(df_5m['Close'], 9)
+    df_5m['EMA21'] = ema(df_5m['Close'], 21)
+    df_5m['EMA50'] = ema(df_5m['Close'], 50)
+    df_5m['RSI'] = rsi(df_5m['Close'])
+    df_5m['MACD'], df_5m['MACD_SIG'], df_5m['MACD_HIST'] = macd(df_5m)
+    df_5m['ADX'], pdi, mdi, atr = adx(df_5m)
+    df_5m['BBW'] = bollinger_width(df_5m['Close'])
     
-    signal = None
-    confidence = 0
-    
-    if ema9 > ema21 > ema50 and rsi > 55 and rsi < 75 and macd_line > macd_signal:
-        if last_close > ema9:
-            confidence = 88
-            if rsi > 60:
-                confidence = 92
-            signal = "CALL (BUY) ⬆️"
-    elif ema9 < ema21 < ema50 and rsi < 45 and rsi > 25 and macd_line < macd_signal:
-        if last_close < ema9:
-            confidence = 87
-            if rsi < 40:
-                confidence = 91
-            signal = "PUT (SELL) ⬇️"
-    
-    return signal, confidence
+    df_15m['EMA9'] = ema(df_15m['Close'], 9)
+    df_15m['EMA21'] = ema(df_15m['Close'], 21)
+    df_30m['EMA50'] = ema(df_30m['Close'], 50)
+    df_30m['EMA200'] = ema(df_30m['Close'], 200)
 
-def analyze_pair(name, yf_symbol):
+    last5 = df_5m.iloc[-1]; last15 = df_15m.iloc[-1]; last30 = df_30m.iloc[-1]
+
+    # HTF Trend
+    trend_30 = "UPTREND" if last30['Close'] > last30['EMA50'] and last30['EMA50'] > last30['EMA200'] else "DOWNTREND" if last30['Close'] < last30['EMA50'] else "SIDEWAYS"
+    trend_15 = "UPTREND" if last15['Close'] > last15['EMA9'] and last15['EMA9'] > last15['EMA21'] else "DOWNTREND" if last15['Close'] < last15['EMA9'] else "SIDEWAYS"
+    trend_5 = "UPTREND" if last5['EMA9'] > last5['EMA21'] > last5['EMA50'] else "DOWNTREND" if last5['EMA9'] < last5['EMA21'] < last5['EMA50'] else "SIDEWAYS"
+
+    if not (trend_30 == trend_15 == trend_5 and trend_30 != "SIDEWAYS"):
+        return None # Trend Match Fail
+
+    # Market Condition
+    if last5['ADX'] < 28 or last5['BBW'] < 0.006 or atr.iloc[-1] < 0.0003:
+        return "BAD_MARKET"
+
+    # Price Action Checks
+    pattern_name, pattern_ok = detect_candle_pattern(df_5m)
+    bos_name, bos_ok = detect_bos_choch(df_5m)
+    sweep_name, sweep_ok = detect_liquidity_sweep(df_5m)
+    ob_fvg_name, ob_ok = detect_order_block_fvg(df_5m)
+    zone_name, zone_ok = detect_demand_supply(df_5m)
+    key_name, key_ok = detect_key_level(last5['Close'], df_1d)
+
+    # High Quality Price Action Must Pass
+    price_action_ok = bos_ok or sweep_ok or ob_ok
+    if not price_action_ok: return None
+    if not pattern_ok: return None
+    if not zone_ok: return None
+    if not key_ok: return None
+
+    # RSI & MACD Final
+    rsi_val = last5['RSI']
+    is_call_setup = trend_30 == "UPTREND" and 60 <= rsi_val <= 75 and last5['MACD'] > last5['MACD_SIG'] and last5['MACD_HIST'] > 0
+    is_put_setup = trend_30 == "DOWNTREND" and 25 <= rsi_val <= 40 and last5['MACD'] < last5['MACD_SIG'] and last5['MACD_HIST'] < 0
+
+    if not (is_call_setup or is_put_setup): return None
+
+    signal = "CALL" if is_call_setup else "PUT"
+    # Confidence Calculation
+    score = 80
+    if bos_ok: score+=5
+    if sweep_ok: score+=5
+    if ob_ok: score+=4
+    if pattern_ok: score+=3
+    confidence = min(score, 98)
+
+    if confidence < 90: return None
+
+    return {
+        "pair": pair_name,
+        "price": last5['Close'],
+        "signal": signal,
+        "confidence": confidence,
+        "trend30": trend_30,
+        "trend15": trend_15,
+        "zone": zone_name,
+        "key": key_name,
+        "pattern": pattern_name,
+        "pa": f"{bos_name} | {sweep_name} | {ob_fvg_name}"
+    }
+
+# --- MAIN LOOP ---
+send_telegram(f"🚀 v16 PRO MAX Bot LIVE - BD Time {get_bd_time().strftime('%H:%M:%S')} - 3 Pair HTF Ready")
+last_bad_market_msg = 0
+no_signal_count = 0
+
+while True:
     try:
-        data = yf.download(yf_symbol, period="1d", interval="1m", progress=False)
-        if len(data) < 60:
-            return None
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-        data = data.dropna()
-        
-        is_good, reason = check_market_condition(data)
-        if not is_good:
-            return None
+        bd_time = get_bd_time()
+        found_signal = False
+        bad_market_pairs = 0
+
+        for name, sym in PAIRS.items():
+            result = analyze_pair(name, sym)
+            if result == "BAD_MARKET":
+                bad_market_pairs += 1
+                continue
+            if result is None:
+                continue
+
+            found_signal = True
+            no_signal_count = 0
             
-        signal, conf = high_accuracy_strategy(data)
-        if signal and conf >= 85:
-            return {"pair": name, "symbol": yf_symbol, "signal": signal, "conf": conf, "price": float(data['Close'].iloc[-1])}
-    except Exception as e:
-        print(f"Error {name}: {e}")
-    return None
+            msg = f"""🔥 <b>v16 PRO MAX SIGNAL</b> 🔥
+💱 <b>{result['pair']}</b>
+📈 HTF: 30M {result['trend30']} | 15M {result['trend15']} | 5M {result['trend30']}
+📍 Zone: {result['zone']} ✅
+🔑 Level: {result['key']} ✅
+🕯️ Candle: {result['pattern']} ✅
+💎 Price Action: {result['pa']} ✅
+📊 Signal: <b>{result['signal']}</b> {'⬆️' if result['signal']=='CALL' else '⬇️'}
+🎯 Confidence: {result['confidence']}%
+💵 Price: {result['price']:.5f}
+⏰ BD Time: {bd_time.strftime('%H:%M')} | Expiry: {EXPIRY_MIN} Min
+✅ 12 Layer Passed - PRO MAX
+"""
+            send_telegram(msg)
+            
+            # Auto Result after 5 min
+            entry_price = result['price']
+            time.sleep(EXPIRY_MIN * 60 + 10)
+            df_check = get_data(sym, "5m")
+            if df_check is not None:
+                exit_price = df_check['Close'].iloc[-1]
+                win = (exit_price > entry_price and result['signal']=="CALL") or (exit_price < entry_price and result['signal']=="PUT")
+                res_msg = f"{'✅ WIN' if win else '❌ LOSS'} - {result['pair']} {result['signal']}\nEntry: {entry_price:.5f} | Exit: {exit_price:.5f}\nBD Time: {get_bd_time().strftime('%H:%M')}"
+                send_telegram(res_msg)
 
-def bot_loop():
-    print("v15 Real Market Bot Started")
-    send_telegram("✅ *v15 Real Market Bot LIVE*\nMode: Real Market (No OTC)\nPairs: 8 Major Pairs\nSignal: Every 30 Min\nAuto Result: ON ✅")
-    while True:
-        try:
-            now = datetime.now()
-            if now.minute % 30 == 0:
-                print(f"Scanning Real Market... {now}")
-                best_signal = None
-                for name, symbol in REAL_PAIRS.items():
-                    result = analyze_pair(name, symbol)
-                    if result:
-                        if best_signal is None or result['conf'] > best_signal['conf']:
-                            best_signal = result
-                    time.sleep(1)
-                
-                if best_signal:
-                    msg = f"""🔥 *v15 FUTURE SIGNAL - REAL MARKET* 🔥
-💱 Pair: `{best_signal['pair']}`
-📊 Signal: *{best_signal['signal']}*
-🎯 Confidence: *{best_signal['conf']}%*
-💵 Price: `{best_signal['price']:.5f}`
-⏰ Time: {now.strftime('%H:%M')} - Expiry 2 Min
-🏦 Broker: Quotex Real Market
-
-✅ *High Confirmation - 5 Layer Check Passed*
-⏳ *Auto Result 2 Min পর আসবে*"""
-                    
-                    send_telegram(msg)
-                    
-                    # ===== AUTO WIN/LOSS THREAD START =====
-                    threading.Thread(
-                        target=check_and_send_result,
-                        args=(best_signal['pair'], best_signal['symbol'], best_signal['price'], best_signal['signal'], now.strftime('%H:%M')),
-                        daemon=True
-                    ).start()
+        if not found_signal:
+            no_signal_count += 1
+            # 60 min = 30 scans (2 min each)
+            if no_signal_count >= 30 and (time.time() - last_bad_market_msg > 3600):
+                if bad_market_pairs >= 2:
+                    send_telegram(f"⚠️ মার্কেট খারাপ ভাই - Choppy / No Setup - 60 Min ধরে High Quality Setup পাচ্ছি না। Wait করো। BD Time {bd_time.strftime('%H:%M')}")
                 else:
-                    print("No High Quality Signal - Market Bad")
-                time.sleep(60)
-            else:
-                time.sleep(20)
-        except Exception as e:
-            print(f"Loop Error: {e}")
-            time.sleep(30)
+                    send_telegram(f"📉 Setup খুঁজছি... এখনো 12 Layer Match হয় নাই। Market Slow। BD Time {bd_time.strftime('%H:%M')}")
+                last_bad_market_msg = time.time()
+                no_signal_count = 0
 
-@app.route('/')
-def home():
-    return "v15 Real Market Bot is Running! - Auto WIN/LOSS ON"
+        time.sleep(120) # Scan every 2 Min
 
-if __name__ == "__main__":
-    t = threading.Thread(target=bot_loop)
-    t.daemon = True
-    t.start()
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    except Exception as e:
+        print(f"Error: {e}")
+        time.sleep(60)
